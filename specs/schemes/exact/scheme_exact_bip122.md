@@ -11,8 +11,8 @@ node. A client MUST NOT select this scheme unless its payer Lightning node retur
 the preimage after payment.
 
 The scheme supports only the `bolt11` asset transfer method and the `upfront`
-payment flow. The resource server processes the protected request only after the
-facilitator validates the proof and records the payment hash.
+payment flow. The resource server processes the request only after the facilitator
+validates the proof and records the payment hash.
 
 This scheme targets x402 protocol version 2 and uses the core
 `PaymentRequirements`, `PaymentPayload`, and `SettlementResponse` types from
@@ -39,10 +39,16 @@ before its preimage is available. The resource server MUST set
 `extra.paymentFlow` to `"upfront"` in every payment requirement. Clients and
 resource servers MUST reject any other value.
 
+The request hash is the SHA-256 digest of a JSON object encoded with the JSON
+Canonicalization Scheme (JCS, RFC 8785). It covers the protocol tag, HTTP method,
+URL, body hash, and selected header names and value hashes. The server sends it
+as `extra.requestHash` and puts it in the invoice's signed BOLT11 description
+hash. See [Request Binding](#request-binding) for the encoding.
+
 The protocol sequence is:
 
-1. The resource server creates a fresh BOLT11 invoice and returns it in a payment
-   requirement.
+1. The resource server computes the request hash and returns a fresh BOLT11
+   invoice that commits to it in a payment requirement.
 2. The client validates and pays the invoice, then constructs a payment payload
    containing the preimage.
 3. The resource server sends the payload to the facilitator's `/settle` endpoint.
@@ -65,9 +71,9 @@ A payer adapter MUST return the payment preimage when it reports a payment as
 paid. A client MUST NOT use an adapter that cannot return the preimage.
 
 A receiver adapter MUST be able to create a fresh invoice for an exact
-millisatoshi amount. The resource server MUST have exclusive invoice-issuance
-authority for the receiver key in `payTo`; an untrusted party MUST NOT be able to
-create invoices signed by that key.
+millisatoshi amount with a caller-supplied BOLT11 description hash. The resource
+server MUST have exclusive invoice-issuance authority for the receiver key in
+`payTo`; an untrusted party MUST NOT be able to create invoices signed by that key.
 
 ## Amounts
 
@@ -94,7 +100,13 @@ satoshis or an explicit atomic `AssetAmount`.
 ## `PaymentRequirements`
 
 The resource server MUST generate a fresh BOLT11 invoice for each payment
-challenge and place it in `extra.invoice`.
+challenge and place it in `extra.invoice`. A fresh invoice MUST use a new 32-byte
+preimage generated with cryptographically secure randomness and a previously
+unused payment hash, including across networks. The signed payment hash
+identifies the challenge.
+
+The server MUST set `extra.requestHash` to the digest of the actual request and
+`extra.requestHeaders` to its configured header list, as specified below.
 
 The following deterministic example is a test vector, not a reusable challenge.
 Its validation time is Unix timestamp `1700000000`, equal to the invoice creation
@@ -106,12 +118,14 @@ time.
   "network": "bip122:000000000019d6689c085ae165831e93",
   "amount": "25000",
   "asset": "BTC",
-  "payTo": "036360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7",
+  "payTo": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
   "maxTimeoutSeconds": 300,
   "extra": {
     "assetTransferMethod": "bolt11",
     "paymentFlow": "upfront",
-    "invoice": "lnbc250n1pj48ugqpp54y3u9s8ylemsv8l3ewyzzu0klhujvuvmkl6llchq23vy8rzjsf0qsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygsdq80q6rqvsxqzfvcqpjpal2l7zmrg46wpsxvv8aly29hzrjhvyxcrxxdm3r4ky8etpthh9p3r2ly8jvtlv6wprwvrm5t2zrxxmvpg57xhf24x2ngrd8smj8jtcp79fu42"
+    "requestHash": "c0c8112de741926ff0f2dd25bd2ca499aa5e94aa5e84f2ce7673cdac7d9078fe",
+    "requestHeaders": [],
+    "invoice": "lnbc250n1pj48ugqpp54y3u9s8ylemsv8l3ewyzzu0klhujvuvmkl6llchq23vy8rzjsf0qsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygshp5crypzt08gxfxlu8jm5jm6t9ynx49a992t6z09nnkw0x6clvs0rlqxqzfvcqpj3lcnmy9k6l6gjfvn0l5xa38psqt9vvgfpj9almwnnhnmszpxqg7q2tskj0mmjz9dh542m4nte6c82nt9s8u4y4s3y6rr0fhqshuuq2gpv2hnla"
   }
 }
 ```
@@ -123,6 +137,8 @@ The `extra` fields are:
 | `extra.assetTransferMethod` | No | If present, MUST be `"bolt11"`; defaults to `"bolt11"`. |
 | `extra.paymentFlow` | Yes | MUST be `"upfront"`. |
 | `extra.invoice` | Yes | Fresh, signed BOLT11 invoice for `amount` on `network` that passes the checks below. |
+| `extra.requestHash` | Yes | Expected request hash, encoded as 64 lowercase hexadecimal characters. |
+| `extra.requestHeaders` | Yes | Sorted array of lowercase request header names included in the digest; may be empty. |
 
 `maxTimeoutSeconds` MUST be a positive integer. The BOLT11 invoice expiry MUST
 equal `maxTimeoutSeconds` exactly.
@@ -139,8 +155,7 @@ verify all of the following:
 1. The BOLT11 amount equals `PaymentRequirements.amount` exactly.
 2. The BOLT11 currency matches the concrete network (`bc` for mainnet, `tb` for
    testnet).
-3. The invoice contains exactly one inline description field (`d`) and no
-   description hash field (`h`).
+3. The invoice's description hash equals the request hash.
 4. The invoice signing key equals `payTo`.
 5. The BOLT11 expiry equals `maxTimeoutSeconds` exactly.
 6. The BOLT11 creation time is not later than the server's validation time plus
@@ -150,12 +165,109 @@ verify all of the following:
 
 The server MUST NOT reuse an invoice across clients or challenges.
 
-`extra.invoice` is a dynamic field. Scheme implementations MUST declare `invoice`
-as a dynamic `extra` field. For a request that includes a `PaymentPayload`, the
-resource server MUST compare every core field and every other server-declared
-`extra` field. The facilitator MUST settle the invoice in
-`PaymentPayload.accepted.extra.invoice`. This permits a paid retry to use its
-original invoice when the server generates a new challenge.
+`extra.invoice` is dynamic. Scheme implementations MUST declare `invoice` as a
+dynamic `extra` field. `requestHash` and `requestHeaders` MUST NOT be dynamic. The
+server MUST derive both from the actual request and its configuration before
+matching requirements. Every core field and every server-declared `extra` field
+except `invoice` MUST match the accepted requirements. This permits a paid retry
+to use its original invoice for the same request.
+
+## Request Binding
+
+The BOLT11 description hash MUST equal the request hash defined below. Clients,
+servers, and facilitators MUST reject invoices without this binding. The invoice
+signature covers both the description hash and the unique payment hash, so
+identical requests can have the same request hash while their invoices remain
+distinct challenges.
+
+The fixed domain tag identifies the binding version and HTTP profile. Other
+transports MUST NOT use this method until a profile defines their request inputs
+and byte encoding.
+
+### HTTP Request Inputs
+
+The client and server compute the binding from the HTTP request itself. Request
+inputs are not copied into `PaymentRequirements` or `PaymentPayload`.
+
+- `method` and `url` MUST use the `@method` and `@target-uri` component rules in
+  [RFC 9421, section 2.2](https://www.rfc-editor.org/rfc/rfc9421.html#section-2.2).
+  The URL MUST be an absolute `http` or `https` URL in ASCII URI syntax, including
+  the query string, without a fragment or user information. Implementations MUST
+  preserve method case, percent escapes, and query parameter order. The server
+  MUST validate the public origin against its configuration and reconstruct it
+  only from trusted proxy information when behind a proxy.
+- `bodyHash` MUST be SHA-256 of the content bytes after transfer decoding and
+  before content decoding or application parsing. An absent body uses SHA-256 of
+  empty bytes. JSON bodies MUST NOT be parsed and serialized before hashing. The
+  paid retry MUST preserve the content bytes.
+- Bound headers MUST be selected by the server's configuration for the resource,
+  never from the client echo. `extra.requestHeaders` MUST contain every header
+  that can affect the purchased operation, content interpretation, or account
+  selection, even when absent. Examples include `content-type`, `content-encoding`,
+  `accept`, `range`, `authorization`, and `cookie` when used for these purposes.
+  Names MUST be lowercase HTTP field-name tokens in ascending ASCII byte order,
+  with no duplicates. An empty array is valid only when no header affects these
+  decisions. `payment-signature` MUST NOT be included.
+
+For each present bound header, `valueHash` MUST be SHA-256 of
+`0x01 || ASCII(value)`, where `value` uses the default field-component rules in
+[RFC 9421, section 2.1](https://www.rfc-editor.org/rfc/rfc9421.html#section-2.1),
+without component parameters. For an absent header it MUST be SHA-256 of the
+single byte `0x00`. This distinguishes absent and empty values. Unsupported field
+values MUST cause rejection.
+
+The server MUST reject requests whose purchased operation depends on context
+not represented by these inputs, such as an account selected only through a TLS
+client certificate. It MUST apply its normal authentication and authorization
+checks on every attempt. `PaymentRequired.resource.url` MUST equal `url`.
+
+### Description Hash Encoding
+
+The client and server MUST construct a JSON object, `binding`, with exactly these
+members:
+
+| Member | Value |
+|---|---|
+| `domain` | The string `"x402:exact:bip122:bolt11:http:1"`. |
+| `method` | The HTTP method defined above. |
+| `url` | The HTTP target URL defined above. |
+| `bodyHash` | The body digest defined above, encoded as 64 lowercase hexadecimal characters. |
+| `headers` | An array with one object per name in `extra.requestHeaders`, in the same order. Each object has exactly `name` and `valueHash` members. `name` is the header name; `valueHash` is its digest defined above, encoded as 64 lowercase hexadecimal characters. |
+
+All members are required, including `headers` when empty. This object contains
+only strings, arrays, and objects. It is constructed locally and is not an
+additional field in `PaymentRequirements` or `PaymentPayload`.
+
+The description bytes MUST be the UTF-8 output of
+[JCS (RFC 8785)](https://www.rfc-editor.org/rfc/rfc8785.html) applied to this object:
+
+```text
+descriptionBytes = UTF8(JCS(binding))
+requestHash = SHA-256(descriptionBytes)
+```
+
+Implementations MUST use JCS serialization rules, including member sorting and
+string escaping. Ordinary JSON serialization is not sufficient. No byte-order
+mark or trailing newline is part of the hash input. JCS applies only to the
+binding object; the HTTP body is still hashed as bytes as specified above.
+
+The BOLT11 description hash MUST contain the raw 32-byte `requestHash` digest.
+`extra.requestHash` MUST contain that same digest as 64 lowercase hexadecimal
+characters. The client has all inputs from its request and the advertised header
+names, so it can reconstruct the description bytes without another server lookup.
+
+The invoice signature also commits to its amount, currency, expiry, and payment
+hash; the signer identifies the receiver. The domain tag fixes the x402 version-2
+`exact`/`bolt11`/`upfront` interpretation. The existing payment-term checks remain
+mandatory. Neither the invoice nor `extra.requestHash` is part of the hash input.
+
+On a paid retry, the server MUST recompute the digest from the request that will
+execute, using its configured header list. It MUST NOT take the expected digest
+from `accepted.extra.requestHash`, `PaymentPayload.resource`, or the accepted
+invoice. It sends the computed digest in `requirements.extra.requestHash` to
+`/settle`. The facilitator MUST compare the accepted invoice's signed description
+hash against that expected digest. Missing binding fields MUST fail rather than
+disable the check. A previous successful claim remains `duplicate_settlement`.
 
 ## `PaymentPayload`
 
@@ -170,12 +282,14 @@ After paying the invoice, the client sends the preimage in the scheme-specific
     "network": "bip122:000000000019d6689c085ae165831e93",
     "amount": "25000",
     "asset": "BTC",
-    "payTo": "036360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f7",
+    "payTo": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
     "maxTimeoutSeconds": 300,
     "extra": {
       "assetTransferMethod": "bolt11",
       "paymentFlow": "upfront",
-      "invoice": "lnbc250n1pj48ugqpp54y3u9s8ylemsv8l3ewyzzu0klhujvuvmkl6llchq23vy8rzjsf0qsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygsdq80q6rqvsxqzfvcqpjpal2l7zmrg46wpsxvv8aly29hzrjhvyxcrxxdm3r4ky8etpthh9p3r2ly8jvtlv6wprwvrm5t2zrxxmvpg57xhf24x2ngrd8smj8jtcp79fu42"
+      "requestHash": "c0c8112de741926ff0f2dd25bd2ca499aa5e94aa5e84f2ce7673cdac7d9078fe",
+      "requestHeaders": [],
+      "invoice": "lnbc250n1pj48ugqpp54y3u9s8ylemsv8l3ewyzzu0klhujvuvmkl6llchq23vy8rzjsf0qsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygshp5crypzt08gxfxlu8jm5jm6t9ynx49a992t6z09nnkw0x6clvs0rlqxqzfvcqpj3lcnmy9k6l6gjfvn0l5xa38psqt9vvgfpj9almwnnhnmszpxqg7q2tskj0mmjz9dh542m4nte6c82nt9s8u4y4s3y6rr0fhqshuuq2gpv2hnla"
     }
   },
   "payload": {
@@ -192,7 +306,49 @@ After paying the invoice, the client sends the preimage in the scheme-specific
 
 `accepted.extra.invoice` MUST be byte-identical to the invoice that the client
 paid. It MAY differ from a newly generated `requirements.extra.invoice` on the
-retry. Its signing key and payment terms MUST pass the checks below.
+retry. Its signing key, request binding, and payment terms MUST pass the checks
+below. No additional challenge identifier or request copy is required.
+
+## Request Binding Test Vectors
+
+The examples above describe `GET https://api.example.com/article/A` with an empty
+body and no bound headers. They use the test-only secp256k1 private key
+`0000000000000000000000000000000000000000000000000000000000000001`.
+The canonical description is the following single line, encoded as UTF-8 without
+its trailing newline:
+
+```json
+{"bodyHash":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","domain":"x402:exact:bip122:bolt11:http:1","headers":[],"method":"GET","url":"https://api.example.com/article/A"}
+```
+
+Its SHA-256 digest, which MUST equal `extra.requestHash` and the signed BOLT11
+description hash, is:
+
+```text
+c0c8112de741926ff0f2dd25bd2ca499aa5e94aa5e84f2ce7673cdac7d9078fe
+```
+
+Changing only the URL to `https://api.example.com/article/B` produces this digest:
+
+```text
+b7cb427b78b6cd988af6c7dbe3c81bf058fbeb47a6fc6e84f5c9288f00bccde8
+```
+
+Each case below starts independently at validation time `1700000000` with an
+empty replay store. Mutations leave the accepted invoice and preimage unchanged
+unless stated otherwise. The server computes `requirements.extra.requestHash`
+from the actual request before calling `/settle`.
+
+| Case | Expected result |
+|---|---|
+| Unchanged examples, including different JSON member order or whitespace. | Settlement succeeds. |
+| Replace only `requirements.extra.invoice` with a fresh valid invoice for the same request and terms. | Settlement succeeds using the original accepted invoice. |
+| Present article A's proof with an actual request for article B at the same price. | `invalid_exact_bip122_request_mismatch`. |
+| Also change the accepted `requestHash` to article B's digest. | `invalid_exact_bip122_invoice_request_mismatch`; the invoice still commits to article A. |
+| Change the actual method to `POST`, or body to the single byte `78` (hexadecimal), and echo the new digest. | `invalid_exact_bip122_invoice_request_mismatch`. |
+| Remove `requestHash` or `requestHeaders` from either side. | `invalid_exact_bip122_request_binding`. |
+| Change only the accepted header list. | `invalid_exact_bip122_request_mismatch`. |
+| Replace the accepted invoice with a valid signed invoice containing an inline description instead of a description hash. | `invalid_exact_bip122_invoice_description`. |
 
 ## Client Payment Construction
 
@@ -204,8 +360,11 @@ Before paying, a client MUST:
 2. Require `extra.paymentFlow == "upfront"` and a non-empty `extra.invoice`. Treat
    a missing `extra.assetTransferMethod` as `"bolt11"` and reject any other value.
 3. Strictly decode and verify the BOLT11 invoice and its signature.
-4. Require exactly one inline description field (`d`) and no description hash
-   field (`h`).
+4. Validate `extra.requestHash` and `extra.requestHeaders`. Compute the request
+   digest from the request the client intends to send and the advertised header
+   list. Require `PaymentRequired.resource.url` to equal the actual target URL.
+   Require exactly one description hash and no inline description. Both the
+   description hash and `extra.requestHash` MUST equal the computed digest.
 5. Require the invoice signing key to equal `payTo`.
 6. Require the invoice currency to match the selected network.
 7. Require the invoice to specify an integral millisatoshi amount equal to
@@ -234,14 +393,21 @@ perform the following checks in order before it records the payment hash:
    integral `amount` and `maxTimeoutSeconds` values, and a valid compressed
    secp256k1 `payTo` encoded as 66 lowercase hexadecimal characters.
 3. Resolve a missing `extra.assetTransferMethod` to `bolt11` on both sides and
-   require `bolt11`. Require `extra.paymentFlow == "upfront"` on both sides. Every
-   server-declared `extra` field other than `invoice` MUST have the same value in
-   `accepted`; additive client fields MAY remain.
+   require `bolt11`. Require `extra.paymentFlow == "upfront"` on both sides.
+   Require both request hashes to be 64 lowercase hexadecimal characters.
+   Validate both header lists' syntax and ordering using the HTTP Request Inputs
+   rules. Require the hashes and header lists to match. Every other server-declared
+   `extra` field except `invoice` MUST have the same value in `accepted`; additive
+   client fields MAY remain.
 4. Require non-empty invoices in `requirements.extra.invoice` and
    `accepted.extra.invoice`. The facilitator MUST use the accepted invoice for
    settlement and MUST NOT require the two invoices to be equal.
 5. Strictly decode and verify the accepted invoice and its signature. Require
-   exactly one inline description field (`d`) and no description hash field (`h`).
+   exactly one description hash and no inline description.
+   Require the signed description hash to equal the 32-byte digest decoded from
+   `requirements.extra.requestHash`. This check is mandatory; missing binding
+   fields MUST fail. The facilitator checks the server-supplied expected digest;
+   it does not need the original HTTP request.
    Require its signing key to equal `requirements.payTo`, its BOLT11 currency to
    match the network, and its integral millisatoshi amount to equal
    `requirements.amount`.
@@ -312,12 +478,15 @@ MUST preserve the validation reason when validation fails.
 | `invalid_exact_bip122_pay_to_mismatch` | `accepted.payTo` differs from the requirement. |
 | `invalid_exact_bip122_pay_to_malformed` | `payTo` is not a lowercase compressed secp256k1 public key. |
 | `invalid_exact_bip122_max_timeout_mismatch` | `accepted.maxTimeoutSeconds` differs from the requirement. |
-| `invalid_exact_bip122_extra_mismatch` | A server-declared non-invoice `extra` field differs. |
+| `invalid_exact_bip122_extra_mismatch` | A server-declared `extra` field other than `invoice`, `requestHash`, or `requestHeaders` differs. |
+| `invalid_exact_bip122_request_binding` | Either request hash or header list is missing or malformed. |
+| `invalid_exact_bip122_request_mismatch` | The accepted request hash or header list differs from the requirement. |
 | `invalid_exact_bip122_asset_transfer_method` | Either explicit asset transfer method is not `bolt11`. |
 | `invalid_exact_bip122_payment_flow` | Either payment flow is missing or not `upfront`. |
 | `invalid_exact_bip122_invoice_missing` | Either required invoice field is absent. |
 | `invalid_exact_bip122_invoice_decode_failed` | Strict BOLT11 decoding, signature validation, or integral-msat validation failed. |
-| `invalid_exact_bip122_invoice_description` | The invoice does not contain exactly one `d` field or contains an `h` field. |
+| `invalid_exact_bip122_invoice_description` | The invoice does not contain exactly one description hash or contains an inline description. |
+| `invalid_exact_bip122_invoice_request_mismatch` | The signed description hash differs from the expected request hash. |
 | `invalid_exact_bip122_invoice_payee_mismatch` | The invoice signing key differs from `payTo`. |
 | `invalid_exact_bip122_invoice_currency_mismatch` | BOLT11 currency does not match the network. |
 | `invalid_exact_bip122_invoice_amount_mismatch` | BOLT11 amount differs from the required millisatoshis. |
@@ -359,9 +528,17 @@ receiver credentials.
 ### Invoice Substitution
 
 On a paid retry, the accepted invoice can differ from the new challenge invoice.
-To prevent substitution, the client and facilitator MUST require the accepted
-invoice's signing key to equal `payTo` and all payment terms to match. A
-self-issued invoice fails unless the attacker controls the receiver node key.
+The server MUST compute the expected request hash from the incoming request
+before matching requirements. A matching client echo alone is insufficient. The
+client and facilitator MUST check the signed description hash against the
+expected digest and require the signing key to equal `payTo` and the
+payment terms to match. A proof for another request fails even if its price and
+receiver are the same. A self-issued invoice fails unless the attacker controls
+the receiver node key.
+
+Request binding does not identify the payer. A disclosed preimage and invoice
+remain bearer proof for the bound request; replay protection permits at most one
+successful claim. No server challenge store or receiver lookup is required.
 
 ### Receiver Key Isolation
 
@@ -404,4 +581,6 @@ or the invoice payee.
 
 - [x402 protocol specification v2](../../x402-specification-v2.md)
 - [BOLT11 payment encoding](https://github.com/lightning/bolts/blob/master/11-payment-encoding.md)
+- [JSON Canonicalization Scheme (RFC 8785)](https://www.rfc-editor.org/rfc/rfc8785.html)
+- [HTTP message components (RFC 9421)](https://www.rfc-editor.org/rfc/rfc9421.html#section-2)
 - [CAIP-2 chain identification](https://chainagnostic.org/CAIPs/caip-2)
