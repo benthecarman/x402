@@ -64,8 +64,8 @@ The protocol sequence is:
 - **Payer**: The client-side Lightning node that pays an invoice.
 - **Payment hash**: The 32-byte value committed to by the BOLT11 invoice.
 - **Preimage**: The 32-byte secret whose SHA-256 digest is the payment hash.
-- **Replay store**: Storage that atomically records settled payment hashes and
-  persists across facilitator restarts.
+- **Replay store**: Storage that atomically records settled network and payment-hash
+  pairs and persists across facilitator restarts.
 
 A payer adapter MUST return the payment preimage when it reports a payment as
 paid. A client MUST NOT use an adapter that cannot return the preimage.
@@ -90,12 +90,30 @@ Examples:
 | 21 satoshis | `"21000"` |
 | 1 bitcoin | `"100000000000"` |
 
-User-facing SDKs SHOULD parse satoshi inputs such as `"21"`, `"21 sat"`, and
-`"21 sats"` as `"21000"`. Parsers MUST use exact decimal arithmetic and reject
-negative values and sub-millisatoshi precision. They MUST also reject fiat or
-bitcoin inputs such as `$1`, `1 USD`, or `0.0001 BTC` unless the application has
-registered a conversion parser. The error SHOULD direct the caller to use
-satoshis or an explicit atomic `AssetAmount`.
+User-facing SDKs MUST use explicit atomic `AssetAmount` pricing by default, for
+example `{ "asset": "BTC", "amount": "21000" }` for 21 satoshis. They MAY also
+accept qualified forms such as `"21 sat"` or `"21 sats"`. Parsers MUST use exact
+decimal arithmetic and reject negative values and sub-millisatoshi precision.
+Bare numeric prices such as `"21"` or `21` MUST NOT default to satoshis. These and
+other forms, such as `$1`, `1 USD`, or `0.0001 BTC`, MUST be rejected unless the
+application has registered a conversion parser. The error SHOULD direct the
+caller to use an explicit atomic `AssetAmount`.
+
+For this method, the x402 settled amount is the invoice amount, which MUST equal
+`PaymentRequirements.amount`. The preimage does not reveal the amount actually
+received. Lightning can settle a payment above the invoice amount, as described
+in [BOLT11](https://github.com/lightning/bolts/blob/master/11-payment-encoding.md#payer--payee-interactions).
+The facilitator MUST accept an otherwise valid proof at the invoice amount even
+if Lightning overpayment occurred. Overpayment grants no additional resource or
+credit. This scheme provides no refund path; any refund is a separate arrangement
+with the receiver. Clients MUST NOT assume a refund is available.
+
+Clients MUST instruct their payer adapter to pay the invoice amount. Routing fees
+are paid by the payer in addition to that amount and do not count toward it. The
+receiver MUST reject payments whose aggregate amount is below the invoice amount
+without releasing the preimage. An incomplete or failed payment MUST NOT
+authorize the resource. Its HTLCs follow Lightning failure or timeout handling;
+there is no x402 refund transaction.
 
 ## `PaymentRequirements`
 
@@ -376,10 +394,11 @@ Before paying, a client MUST:
 10. Ask its payer adapter to pay the invoice on the selected network.
 
 The payer result MUST report `paid` and identify the same invoice, payment hash,
-and amount. The client SHOULD report `in_flight` as a distinct result so the caller
-can retry without starting a second payment. For a paid result, the client MUST
-validate the preimage format and SHA-256 digest. It MUST NOT construct a
-`PaymentPayload` if a check fails.
+and invoice amount. Any separately reported routing fee MUST NOT be included in
+the amount comparison. The client SHOULD report `in_flight` as a distinct result
+so the caller can retry without starting a second payment. For a paid result,
+the client MUST validate the preimage format and SHA-256 digest. It MUST NOT
+construct a `PaymentPayload` if a check fails.
 
 ## Facilitator Validation
 
@@ -440,11 +459,21 @@ This grace period permits a retry when payment completed shortly before expiry.
 ## Settlement and Replay Protection
 
 Settlement does not move funds. The Lightning payment completed before the client
-received the preimage. After validation, the facilitator MUST atomically insert the
-payment hash into a restart-durable replay store. The insert MUST fail if the hash
-already exists. In that case, the facilitator MUST return `duplicate_settlement`.
-The resource server MUST NOT process the protected request until the insert
-succeeds.
+received the preimage. The canonical consumption key MUST be the ASCII string:
+
+```text
+network + ":" + payment_hash
+```
+
+`network` is the validated concrete CAIP-2 network identifier. `payment_hash` is
+the accepted invoice's payment hash, encoded as 64 lowercase hexadecimal
+characters without a prefix. The separator is one colon, with no whitespace.
+
+After validation, the facilitator MUST atomically insert this key into a
+restart-durable replay store. The insert MUST fail if the key already exists. In
+that case, the facilitator MUST return `duplicate_settlement`. The resource server
+MUST NOT process the protected request until the insert succeeds. The same hash
+on different networks produces different keys.
 
 The replay entry MUST remain until at least one hour after
 `invoice_end + skew`. It MUST NOT be removed while the invoice can still pass
@@ -493,7 +522,7 @@ MUST preserve the validation reason when validation fails.
 | `invalid_exact_bip122_max_timeout` | `maxTimeoutSeconds` is not a positive integer. |
 | `invalid_exact_bip122_invoice_expiry_mismatch` | BOLT11 expiry does not equal `maxTimeoutSeconds`. |
 | `invalid_exact_bip122_invoice_created_in_future` | BOLT11 creation time exceeds validation time plus the clock-skew allowance. |
-| `duplicate_settlement` | The payment hash is already used or lost an atomic settlement race. |
+| `duplicate_settlement` | The network and payment-hash pair is already used or lost an atomic settlement race. |
 | `invalid_exact_bip122_preimage_missing` | `payload.preimage` is absent. |
 | `invalid_exact_bip122_preimage_malformed` | Preimage contains non-lowercase-hex characters. |
 | `invalid_exact_bip122_preimage_length` | Decoded preimage is not exactly 32 bytes. |
@@ -564,12 +593,12 @@ invoice MUST NOT appear under the mainnet identifier.
 
 ### Durable Replay Protection
 
-An in-memory replay store is not compliant because a restart loses used payment
-hashes. All facilitator instances that settle for the same receiver MUST share a
+An in-memory replay store is not compliant because a restart loses consumed keys.
+All facilitator instances that settle for the same receiver MUST share a
 restart-durable replay store with an atomic insert. A resource server MUST NOT send
 invoices for one receiver to independent replay stores. A database can enforce
-this rule with a unique payment-hash key. Persistent state is required because
-Lightning has no public spent marker for the bearer proof.
+this rule with a unique canonical consumption key. Persistent state is required
+because Lightning has no public spent marker for the bearer proof.
 
 ### Payer Anonymity
 
