@@ -121,7 +121,7 @@ The resource server MUST generate a fresh BOLT11 invoice for each payment
 challenge and place it in `extra.invoice`. A fresh invoice MUST use a new 32-byte
 preimage generated with cryptographically secure randomness and a previously
 unused payment hash, including across networks. The signed payment hash
-identifies the challenge.
+identifies the invoice.
 
 The server MUST set `extra.requestHash` to the digest of the actual request and
 `extra.requestHeaders` to its configured header list, as specified below.
@@ -194,9 +194,14 @@ to use its original invoice for the same request.
 
 The BOLT11 description hash MUST equal the request hash defined below. Clients,
 servers, and facilitators MUST reject invoices without this binding. The invoice
-signature covers both the description hash and the unique payment hash, so
-identical requests can have the same request hash while their invoices remain
-distinct challenges.
+signature covers both the description hash and the unique payment hash. Identical
+requests can have the same request hash while their invoices have distinct payment
+hashes.
+
+The payment hash identifies the invoice, not a particular HTTP request attempt.
+An unused proof MUST be accepted for another challenge with the same request
+binding and payment terms if all validation rules pass. Servers need not track
+issued payment hashes per challenge.
 
 The fixed domain tag identifies the binding version and HTTP profile. Other
 transports MUST NOT use this method until a profile defines their request inputs
@@ -361,6 +366,9 @@ from the actual request before calling `/settle`.
 |---|---|
 | Unchanged examples, including different JSON member order or whitespace. | Settlement succeeds. |
 | Replace only `requirements.extra.invoice` with a fresh valid invoice for the same request and terms. | Settlement succeeds using the original accepted invoice. |
+| Issue two concurrent challenges for the same request and terms. Pay only the first invoice, then present its proof against the second challenge. | Settlement succeeds using the first invoice; no record linking it to the second challenge is needed. |
+| Present the same paid proof concurrently against both challenges for the same request and terms. | Exactly one settlement succeeds; the other returns `duplicate_settlement`. |
+| Pay both invoices for concurrent challenges with the same request and terms, then present each invoice's own proof. | Both settlements succeed; each payment has a distinct consumption key. |
 | Present article A's proof with an actual request for article B at the same price. | `invalid_exact_bip122_request_mismatch`. |
 | Also change the accepted `requestHash` to article B's digest. | `invalid_exact_bip122_invoice_request_mismatch`; the invoice still commits to article A. |
 | Change the actual method to `POST`, or body to the single byte `78` (hexadecimal), and echo the new digest. | `invalid_exact_bip122_invoice_request_mismatch`. |
@@ -459,7 +467,9 @@ This grace period permits a retry when payment completed shortly before expiry.
 ## Settlement and Replay Protection
 
 Settlement does not move funds. The Lightning payment completed before the client
-received the preimage. The canonical consumption key MUST be the ASCII string:
+received the preimage. Cryptographic proof verification is stateless, but enforcing
+single-use settlement requires a replay store. The canonical consumption key MUST
+be the ASCII string:
 
 ```text
 network + ":" + payment_hash
